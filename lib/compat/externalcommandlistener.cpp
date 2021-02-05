@@ -40,7 +40,7 @@ void ExternalCommandListener::Start(bool runtimeCreated)
 		<< "This feature is DEPRECATED and will be removed in future releases. Check the roadmap at https://github.com/Icinga/icinga2/milestones";
 #ifndef _WIN32
 	String path = GetCommandPath();
-	m_CommandThread = std::thread([path]() { CommandPipeThread(path); });
+	m_CommandThread = std::thread([this, path]() { CommandPipeThread(path); });
 	m_CommandThread.detach();
 #endif /* _WIN32 */
 }
