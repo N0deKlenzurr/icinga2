@@ -86,7 +86,7 @@ static Array::Ptr ArraySort(const std::vector<Value>& args)
 		ObjectLock olock(arr);
 		std::sort(arr->Begin(), arr->End(), [&args](const Value& a, const Value& b) -> bool {
 			Function::Ptr cmp = args[0];
-			return cmp->Invoke({a, b});
+			return cmp->Invoke({ a, b });
 		});
 	}
 
