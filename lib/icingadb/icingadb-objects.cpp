@@ -154,6 +154,7 @@ void IcingaDB::UpdateAllConfigObjects()
 	};
 	DeleteKeys(globalKeys, Prio::Config);
 	DeleteKeys({"icinga:nextupdate:host", "icinga:nextupdate:service"}, Prio::CheckResult);
+	m_Rcon->Sync();
 
 	upq.ParallelFor(types, [this](const TypePair& type) {
 		String lcType = type.second;
@@ -219,7 +220,7 @@ void IcingaDB::UpdateAllConfigObjects()
 
 					if (transaction.size() > 1) {
 						transaction.push_back({"EXEC"});
-						m_Rcon->FireAndForgetQueries(std::move(transaction), Prio::Config);
+						m_Rcons[type.first]->FireAndForgetQueries(std::move(transaction), Prio::Config);
 						transaction = {{"MULTI"}};
 					}
 				}
@@ -235,7 +236,7 @@ void IcingaDB::UpdateAllConfigObjects()
 					if (zAdds->size() >= 102u) {
 						std::vector<String> header (zAdds->begin(), zAdds->begin() + 2u);
 
-						m_Rcon->FireAndForgetQuery(std::move(*zAdds), Prio::CheckResult);
+						m_Rcons[type.first]->FireAndForgetQuery(std::move(*zAdds), Prio::CheckResult);
 
 						*zAdds = std::move(header);
 					}
@@ -267,12 +268,12 @@ void IcingaDB::UpdateAllConfigObjects()
 
 			if (transaction.size() > 1) {
 				transaction.push_back({"EXEC"});
-				m_Rcon->FireAndForgetQueries(std::move(transaction), Prio::Config);
+				m_Rcons[type.first]->FireAndForgetQueries(std::move(transaction), Prio::Config);
 			}
 
 			for (auto zAdds : {&hostZAdds, &serviceZAdds}) {
 				if (zAdds->size() > 2u) {
-					m_Rcon->FireAndForgetQuery(std::move(*zAdds), Prio::CheckResult);
+					m_Rcons[type.first]->FireAndForgetQuery(std::move(*zAdds), Prio::CheckResult);
 				}
 			}
 
@@ -290,7 +291,8 @@ void IcingaDB::UpdateAllConfigObjects()
 			}
 		}
 
-		m_Rcon->FireAndForgetQuery({"XADD", "icinga:dump", "*", "type", lcType, "state", "done"}, Prio::Config);
+		m_Rcons[type.first]->FireAndForgetQuery({"XADD", "icinga:dump", "*", "type", lcType, "state", "done"}, Prio::Config);
+		m_Rcons[type.first]->Sync();
 	});
 
 	upq.Join();

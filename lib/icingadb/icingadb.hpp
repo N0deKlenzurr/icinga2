@@ -13,6 +13,7 @@
 #include "icinga/downtime.hpp"
 #include "remote/messageorigin.hpp"
 #include <memory>
+#include <unordered_map>
 #include <utility>
 
 namespace icinga
@@ -143,6 +144,7 @@ private:
 	bool m_ConfigDumpDone;
 
 	RedisConnection::Ptr m_Rcon;
+	std::unordered_map<ConfigType*, RedisConnection::Ptr> m_Rcons;
 };
 }
 
