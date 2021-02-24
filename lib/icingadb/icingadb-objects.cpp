@@ -32,6 +32,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <utility>
 
@@ -161,16 +162,64 @@ void IcingaDB::UpdateAllConfigObjects()
 		std::vector<String> keys = GetTypeObjectKeys(lcType);
 		DeleteKeys(keys, Prio::Config);
 
-		auto objectChunks (ChunkObjects(type.first->GetObjects(), 500));
-
 		WorkQueue upqObjectType(25000, Configuration::Concurrency);
 		upqObjectType.SetName("IcingaDB:ConfigDump:" + lcType);
 
-		upqObjectType.ParallelFor(objectChunks, [this, &type, &lcType](decltype(objectChunks)::const_reference chunk) {
+		std::map<String, String> redisCheckSums;
+		String configCheckSum = m_PrefixConfigCheckSum + lcType;
+
+		upqObjectType.Enqueue([this, &configCheckSum, &redisCheckSums]() {
+			String cursor = "0";
+
+			do {
+				Array::Ptr res = m_Rcon->GetResultOfQuery({
+					"HSCAN", configCheckSum, cursor, "COUNT", "1000"
+				}, Prio::Config);
+
+				Array::Ptr kvs = res->Get(1);
+				Value* key = nullptr;
+				ObjectLock oLock (kvs);
+
+				for (auto& kv : kvs) {
+					if (key) {
+						redisCheckSums.emplace(std::move(*key), std::move(kv));
+						key = nullptr;
+					} else {
+						key = &kv;
+					}
+				}
+
+				cursor = res->Get(0);
+			} while (cursor != "0");
+		});
+
+		auto objectChunks (ChunkObjects(type.first->GetObjects(), 500));
+
+		std::map<String, std::vector<std::vector<String>>> ourContentRaw;
+		std::mutex ourContentMutex;
+		String configObject = m_PrefixConfigObject + lcType;
+
+		ourContentRaw[configCheckSum];
+		ourContentRaw[configObject];
+
+		upqObjectType.ParallelFor(objectChunks, [&](decltype(objectChunks)::const_reference chunk) {
 			std::map<String, std::vector<String>> hMSets, publishes;
 			std::vector<String> states 							= {"HMSET", m_PrefixStateObject + lcType};
 			std::vector<std::vector<String> > transaction 		= {{"MULTI"}};
 			std::vector<String> hostZAdds = {"ZADD", "icinga:nextupdate:host"}, serviceZAdds = {"ZADD", "icinga:nextupdate:service"};
+
+			auto skimObjects ([&]() {
+				std::lock_guard<std::mutex> l (ourContentMutex);
+
+				for (auto& kv : ourContentRaw) {
+					auto pos (hMSets.find(kv.first));
+
+					if (pos != hMSets.end()) {
+						kv.second.emplace_back(std::move(pos->second));
+						hMSets.erase(pos);
+					}
+				}
+			});
 
 			bool dumpState = (lcType == "host" || lcType == "service");
 
@@ -189,6 +238,8 @@ void IcingaDB::UpdateAllConfigObjects()
 
 				bulkCounter++;
 				if (!(bulkCounter % 100)) {
+					skimObjects();
+
 					for (auto& kv : hMSets) {
 						if (!kv.second.empty()) {
 							kv.second.insert(kv.second.begin(), {"HMSET", kv.first});
@@ -242,6 +293,8 @@ void IcingaDB::UpdateAllConfigObjects()
 				}
 			}
 
+			skimObjects();
+
 			for (auto& kv : hMSets) {
 				if (!kv.second.empty()) {
 					kv.second.insert(kv.second.begin(), {"HMSET", kv.first});
@@ -288,6 +341,146 @@ void IcingaDB::UpdateAllConfigObjects()
 					boost::rethrow_exception(exc);
 				}
 			}
+		}
+
+		std::map<String, std::map<String, String>> ourContent;
+
+		for (auto& source : ourContentRaw) {
+			upqObjectType.Enqueue([&]() {
+				auto& dest (ourContent[source.first]);
+
+				for (auto& hMSet : source.second) {
+					String* key = nullptr;
+
+					for (auto& kv : hMSet) {
+						if (key) {
+							dest.emplace(std::move(*key), std::move(kv));
+							key = nullptr;
+						} else {
+							key = &kv;
+						}
+					}
+
+					hMSet.clear();
+				}
+
+				source.second.clear();
+			});
+		}
+
+		upqObjectType.Join();
+		ourContentRaw.clear();
+
+		auto& ourCheckSums (ourContent[configCheckSum]);
+		auto& ourObjects (ourContent[configObject]);
+		std::vector<String> setChecksum, setObject, delChecksum, delObject;
+
+		auto redisCurrent (redisCheckSums.begin());
+		auto redisEnd (redisCheckSums.end());
+		auto ourCurrent (ourCheckSums.begin());
+		auto ourEnd (ourCheckSums.end());
+
+		auto flushSets ([&]() {
+			setChecksum.insert(setChecksum.begin(), configCheckSum);
+			setChecksum.insert(setChecksum.begin(), "HMSET");
+			setObject.insert(setObject.begin(), configObject);
+			setObject.insert(setObject.begin(), "HMSET");
+
+			std::vector<std::vector<String>> transaction;
+
+			transaction.emplace_back(std::vector<String>{"MULTI"});
+			transaction.emplace_back(std::move(setChecksum));
+			transaction.emplace_back(std::move(setObject));
+			transaction.emplace_back(std::vector<String>{"EXEC"});
+
+			setChecksum.clear();
+			setObject.clear();
+
+			m_Rcon->FireAndForgetQueries(std::move(transaction), Prio::Config);
+		});
+
+		auto flushDels ([&]() {
+			delChecksum.insert(delChecksum.begin(), configCheckSum);
+			delChecksum.insert(delChecksum.begin(), "HDEL");
+			delObject.insert(delObject.begin(), configObject);
+			delObject.insert(delObject.begin(), "HDEL");
+
+			std::vector<std::vector<String>> transaction;
+
+			transaction.emplace_back(std::vector<String>{"MULTI"});
+			transaction.emplace_back(std::move(delChecksum));
+			transaction.emplace_back(std::move(delObject));
+			transaction.emplace_back(std::vector<String>{"EXEC"});
+
+			delChecksum.clear();
+			delObject.clear();
+
+			m_Rcon->FireAndForgetQueries(std::move(transaction), Prio::Config);
+		});
+
+		auto setOne ([&]() {
+			setChecksum.emplace_back(ourCurrent->first);
+			setChecksum.emplace_back(ourCurrent->second);
+			setObject.emplace_back(ourCurrent->first);
+			setObject.emplace_back(ourObjects[ourCurrent->first]);
+
+			if (setChecksum.size() == 100u) {
+				flushSets();
+			}
+		});
+
+		auto delOne ([&]() {
+			delChecksum.emplace_back(redisCurrent->first);
+			delObject.emplace_back(redisCurrent->first);
+
+			if (delChecksum.size() == 100u) {
+				flushDels();
+			}
+		});
+
+		for (;;) {
+			if (redisCurrent == redisEnd) {
+				for (; ourCurrent != ourEnd; ++ourCurrent) {
+					setOne();
+				}
+
+				break;
+			}
+
+			if (ourCurrent == ourEnd) {
+				for (; redisCurrent != redisEnd; ++redisCurrent) {
+					delOne();
+				}
+
+				break;
+			}
+
+			if (redisCurrent->first < ourCurrent->first) {
+				delOne();
+				++redisCurrent;
+				continue;
+			}
+
+			if (redisCurrent->first > ourCurrent->first) {
+				setOne();
+				++ourCurrent;
+				continue;
+			}
+
+			if (redisCurrent->second != ourCurrent->second) {
+				setOne();
+			}
+
+			++redisCurrent;
+			++ourCurrent;
+		}
+
+		if (delChecksum.size()) {
+			flushDels();
+		}
+
+		if (setChecksum.size()) {
+			flushSets();
 		}
 
 		m_Rcon->FireAndForgetQuery({"XADD", "icinga:dump", "*", "type", lcType, "state", "done"}, Prio::Config);
@@ -351,8 +544,6 @@ void IcingaDB::DeleteKeys(const std::vector<String>& keys, RedisConnection::Quer
 std::vector<String> IcingaDB::GetTypeObjectKeys(const String& type)
 {
 	std::vector<String> keys = {
-			m_PrefixConfigObject + type,
-			m_PrefixConfigCheckSum + type,
 			m_PrefixConfigObject + type + ":customvar",
 	};
 
